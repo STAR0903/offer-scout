@@ -12,9 +12,15 @@ import (
 )
 
 func main() {
-	// 强制所有日志输出到 Stderr，防止干扰 MCP 的 Stdout 通信
-	log.SetOutput(os.Stderr)
+	// 创建一个日志文件记录 MCP 服务端的调试信息
+	logFile, err := os.OpenFile("mcp_server.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err == nil {
+		log.SetOutput(logFile)
+	} else {
+		log.SetOutput(os.Stderr)
+	}
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	log.Println("OfferScout MCP Server 启动...")
 
 	// 创建 MCP Server
 	s := server.NewMCPServer(
@@ -45,7 +51,7 @@ func main() {
 	s.AddTool(scrapePostsTool, handleScrapePosts)
 
 	// 使用 stdio 传输方式启动服务
-	log.Println("OfferScout MCP Server 启动中...")
+	log.Println("OfferScout MCP Server 开始通过 stdio 提供服务...")
 	if err := server.ServeStdio(s); err != nil {
 		log.Printf("服务器运行致命错误: %v\n", err)
 	}

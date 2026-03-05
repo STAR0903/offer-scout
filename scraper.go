@@ -381,15 +381,26 @@ func (s *Scraper) scrapePostContentFast(ctx context.Context, postURL string) (st
 	}
 
 	// 核心修复：寻找 window.__INITIAL_STATE__ 并根据 ID 精准匹配
-	// 核心修复：更健壮地寻找 window.__INITIAL_STATE__
-	// 牛客的这个变量可能非常巨大（包含几万行的 JSON），正则非贪婪匹配容易在中间的字符串处中断
-	re := regexp.MustCompile(`window\.__INITIAL_STATE__\s*=\s*(\{.+?\});\s*<`)
-	if !re.MatchString(html) {
-		// 备选方案：匹配到行尾
-		re = regexp.MustCompile(`window\.__INITIAL_STATE__\s*=\s*(\{.*\});`)
+	// 核心修复：坚决避免在超大 HTML 上使用带贪婪或非贪婪修饰符的正则表达式去抓取 window.__INITIAL_STATE__
+	// 牛客的 state 可能有十几兆，正则极易回溯锁死 CPU
+	var matches []string
+	stateKeyword := "window.__INITIAL_STATE__"
+	if idx := strings.Index(html, stateKeyword); idx != -1 {
+		// 定位到等号和左大括号
+		startIdx := strings.Index(html[idx:], "{")
+		if startIdx != -1 {
+			startIdx += idx
+			// 寻找闭合标签的特征
+			scriptEndIdx := strings.Index(html[startIdx:], "</script>")
+			if scriptEndIdx != -1 {
+				scriptEndIdx += startIdx
+				// 抹掉尾部的无用字符
+				jsonStr := strings.TrimRight(html[startIdx:scriptEndIdx], " \n\r\t;")
+				matches = []string{"", jsonStr}
+			}
+		}
 	}
 
-	matches := re.FindStringSubmatch(html)
 	if len(matches) >= 2 {
 		var data interface{}
 		if err := json.Unmarshal([]byte(matches[1]), &data); err == nil {
