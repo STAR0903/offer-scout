@@ -297,12 +297,7 @@ func (s *Scraper) fetchPageLinksViaAPI(ctx context.Context, query string, page i
 	var res struct {
 		Data struct {
 			Records []struct {
-				Data struct {
-					ContentData struct {
-						Title string `json:"title"`
-						UUID  string `json:"uuid"`
-					} `json:"contentData"`
-				} `json:"data"`
+				Data map[string]interface{} `json:"data"`
 			} `json:"records"`
 		} `json:"data"`
 	}
@@ -313,12 +308,43 @@ func (s *Scraper) fetchPageLinksViaAPI(ctx context.Context, query string, page i
 
 	var posts []Post
 	for _, rec := range res.Data.Records {
-		title := rec.Data.ContentData.Title
-		uuid := rec.Data.ContentData.UUID
-		if title != "" && uuid != "" {
+		var title, uuid, idStr string
+		var contentType float64
+
+		if ct, ok := rec.Data["contentType"].(float64); ok {
+			contentType = ct
+		}
+
+		// 遍历 data 下的所有字段（例如 momentData, postData, contentData 等）
+		for _, val := range rec.Data {
+			if m, ok := val.(map[string]interface{}); ok {
+				if t, ok := m["title"].(string); ok && t != "" {
+					title = t
+				}
+				if u, ok := m["uuid"].(string); ok && u != "" {
+					uuid = u
+				}
+				if idVal, ok := m["id"]; ok {
+					idStr = fmt.Sprintf("%v", idVal)
+				}
+			}
+		}
+
+		if title != "" {
+			var link string
+			// 根据 contentType 和数据是否存在生成链接
+			if contentType == 250 && idStr != "" {
+				link = fmt.Sprintf("https://www.nowcoder.com/discuss/%s?sourceSSR=search", idStr)
+			} else if uuid != "" {
+				link = fmt.Sprintf("https://www.nowcoder.com/feed/main/detail/%s?sourceSSR=search", uuid)
+			} else if idStr != "" {
+				link = fmt.Sprintf("https://www.nowcoder.com/discuss/%s?sourceSSR=search", idStr)
+			} else {
+				continue
+			}
 			posts = append(posts, Post{
 				Title: title,
-				Link:  fmt.Sprintf("https://www.nowcoder.com/feed/main/detail/%s", uuid),
+				Link:  link,
 			})
 		}
 	}
@@ -367,6 +393,11 @@ func (s *Scraper) scrapePostContentFast(ctx context.Context, postURL string) (st
 	if len(matches) >= 2 {
 		var data interface{}
 		if err := json.Unmarshal([]byte(matches[1]), &data); err == nil {
+			// 先检查是否是“内容不存在”等错误页面
+			if errMsg := checkErrorMessage(data); errMsg != "" {
+				return errMsg, nil
+			}
+
 			bestContent := ""
 			// 优先尝试根据 ID 精准定位
 			if targetID != "" {
@@ -378,7 +409,10 @@ func (s *Scraper) scrapePostContentFast(ctx context.Context, postURL string) (st
 				findAllContentsWeighted(data, "content", &bestContent)
 			}
 
-			if len([]rune(bestContent)) > 50 {
+			// 放宽长度限制，很多帖子只有几句话或全是图片
+			if len([]rune(bestContent)) >= 5 {
+				return truncateContent(cleanText(stripHTML(bestContent)), 50000), nil
+			} else if bestContent != "" {
 				return truncateContent(cleanText(stripHTML(bestContent)), 50000), nil
 			}
 		}
@@ -428,7 +462,14 @@ func findContentByTargetID(v interface{}, targetID string) string {
 						}
 					}
 				}
+				// 递归查找当前对象下的深层 content（复用过滤逻辑，抛弃评论等）
+				var localBest string
+				findAllContentsWeighted(x, "content", &localBest)
+				if len([]rune(localBest)) > len([]rune(best)) {
+					best = localBest
+				}
 			}
+			// 继续往下级节点遍历
 			for _, v := range x {
 				traverse(v)
 			}
@@ -440,6 +481,36 @@ func findContentByTargetID(v interface{}, targetID string) string {
 	}
 	traverse(v)
 	return best
+}
+
+// checkErrorMessage 检查 JSON 数据中是否有明确的错误提示（如帖子已被删除）
+func checkErrorMessage(v interface{}) string {
+	msg := ""
+	var traverse func(val interface{})
+	traverse = func(val interface{}) {
+		if msg != "" {
+			return
+		}
+		switch x := val.(type) {
+		case map[string]interface{}:
+			// 检查形如 {"showMessage": {"message": "内容不存在!"}} 的结构
+			if sm, ok := x["showMessage"].(map[string]interface{}); ok {
+				if m, ok := sm["message"].(string); ok && m != "" {
+					msg = m
+					return
+				}
+			}
+			for _, v := range x {
+				traverse(v)
+			}
+		case []interface{}:
+			for _, v := range x {
+				traverse(v)
+			}
+		}
+	}
+	traverse(v)
+	return msg
 }
 
 // findAllContentsWeighted 递归扫描所有字段，并将最长的目标字段保存在 bestContent 中（避开已知噪点路径）
@@ -454,8 +525,11 @@ func findAllContentsWeighted(v interface{}, target string, bestContent *string) 
 			}
 		}
 		for k, v := range val {
-			// 避开推荐列表、热榜等干扰项
-			if k == "hotList" || k == "recommendList" || k == "adList" || k == "bannerList" {
+			// 避开推荐列表、热榜、评论、相关内容等干扰项
+			if k == "hotList" || k == "recommendList" || k == "adList" || k == "bannerList" ||
+				k == "commentList" || k == "commentListFirst" || k == "comments" || k == "commentExposure" ||
+				k == "relateContents" || k == "relevantPosts" || k == "similarPosts" || k == "subjectData" ||
+				k == "relatedDiscuss" || k == "voteData" || k == "answerList" || k == "hotSubjectList" || k == "similarRecommend" {
 				continue
 			}
 			findAllContentsWeighted(v, target, bestContent)
@@ -482,6 +556,9 @@ func extractMetaContent(doc *goquery.Document) string {
 	if content != "" {
 		content = strings.ReplaceAll(content, "_牛客网_牛客在手,offer不愁", "")
 		content = strings.TrimSpace(content)
+		if strings.Contains(content, "求职之前，先上牛客") {
+			return ""
+		}
 		return content
 	}
 	return ""
